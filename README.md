@@ -9,9 +9,11 @@ Built for the **Krea2 / Flux.2-Klein** single-stream DiT (incl. the fp8 turbo mo
 ## Why it's different
 A normal LoRA stack *merges* each LoRA's weight delta into the model globally, so both
 identities bleed into every pixel. This node never merges them: it injects each LoRA's
-**activation delta** (`up @ down * scale`) only into the image tokens inside that
-character's region, at forward time. The base model still runs full attention across
-the whole image, so you get one natural, interacting scene — just with distinct faces.
+**activation delta** (`up @ down * scale`) at forward time — into the image tokens inside
+that character's region, and (at `text_strength`, default 1.0) into the shared prompt
+tokens, the trigger-word pathway a global LoRA load would also transform. The base model
+still runs full attention across the whole image, so you get one natural, interacting
+scene — just with distinct faces.
 
 It also runs on **fp8 Krea2**, where the native ComfyUI hook-LoRA path crashes
 (`'Linear' object has no attribute 'weight_scale'`), because we touch activations, not
@@ -26,6 +28,12 @@ quantized weights.
 1. Copy the `regional_character_lora/` folder into `ComfyUI/custom_nodes/`.
 2. Restart ComfyUI.
 3. Add node: **conditioning/regional → "Krea2 Regional Character LoRA"**.
+
+Two nodes are provided:
+- **Krea2 Regional Character LoRA** — one LoRA per zone (A/B).
+- **Krea2 Regional Character LoRA (Stack)** — up to **3 LoRAs per zone** (e.g. character
+  + outfit + style in the same region). Leave unused slots as `None`. Same regional
+  engine and widgets otherwise.
 
 (Optional) Run `recon_krea2.py` once to confirm your LoRA keys map onto the model —
 see the header of that file for usage. It's pure-stdlib and needs no GPU.
@@ -51,6 +59,13 @@ UNETLoader → ModelSamplingFlux → Krea2 Regional Character LoRA → KSampler
 - **seam_feather** — softness of region edges (low sensitivity unless regions overlap).
 - **blend_override** — 0 = clean split; raise toward ~0.5 to let overlapping bodies mix.
   Identities collapse past ~0.8.
+- **text_strength** — how strongly each LoRA also transforms the shared prompt/
+  conditioning tokens inside the diffusion model. **1.0** *(default)* behaves like a
+  global LoRA load on that pathway — expect much stronger identity than older builds;
+  **0** restores the old image-tokens-only behavior. Both regions share the prompt
+  tokens, so lower it if the characters bleed into each other. (Unrelated to the `clip`
+  strength on stock loaders — that patches the separate text encoder; this stays in the
+  model-only path.)
 - **mask_a / mask_b** *(experimental)* — feed hand-painted MASK tensors to override.
 
 ## The one rule that matters: place the box where the LoRA's features live
@@ -61,8 +76,9 @@ A box that misses the face gives weak identity. (This is why simple side-by-side
 "just works" — each full-height column always contains a face.)
 
 ## Tips from testing
-- The **prompt only needs scene / pose / framing** — the mask carries identity and
-  placement. Trigger words are optional but good insurance for overlapping poses.
+- With `text_strength` at its default, **include each LoRA's trigger word in the
+  prompt** — the prompt-token pathway now carries identity too, and the trigger word is
+  how a LoRA's text-side delta finds its character. The mask still controls placement.
 - **Faces must not occlude each other.** Bodies can overlap freely; keep the two faces
   in separate regions.
 - Complex/tangled poses can produce anatomy errors — that's the **base model**, not this
@@ -73,5 +89,12 @@ A box that misses the face gives weak identity. (This is why simple side-by-side
 Works well for 2 characters across side-by-side, stacked, and overlapping comps.
 Known rough edges: `bbox` wire + `mask_a/b` inputs are experimental/under-tested;
 3+ characters not yet supported; expression can flatten on the turbo model at CFG 1.
+
+Recent fixes (full writeup in `JOURNAL.md`): LoRA deltas reach the shared prompt tokens
+and Krea2's internal text-conditioning stack (`text_strength`, previously dropped or
+silently fraction-strength — the cause of "much weaker than a global load"); manual/bbox
+region masks now peak at full strength inside their box; diffusers-named Krea2 LoRAs
+match correctly; loud console warnings for unmatched targets and unsupported
+(LoHa/LyCORIS) files.
 
 Feedback welcome.

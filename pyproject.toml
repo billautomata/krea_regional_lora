@@ -1,0 +1,15 @@
+[project]
+name = "krea_regional_lora"
+description = "Two character LoRAs in one Krea2 / Flux.2-Klein image, each confined to its own region without identity blend. Forward-hook activation injection (fp8-safe), visual region editor, LoRA stacking per zone."
+version = "1.0.0"
+license = {file = "LICENSE"}
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/billautomata/krea_regional_lora"
+
+# Used by the Comfy Registry https://registry.comfy.org
+[tool.comfy]
+PublisherId = "billautomata"
+DisplayName = "Krea2 Regional Character LoRA"
+Icon = ""

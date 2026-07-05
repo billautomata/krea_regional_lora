@@ -57,7 +57,7 @@ except Exception:
     _WRAPPER_ENUM = "diffusion_model"
 
 WRAPPER_KEY = "regional_character_lora"
-__version__ = "1.0.0-beta"
+__version__ = "1.0.0"   # keep in sync with pyproject.toml
 
 
 # ----------------------------------------------------------------------------
