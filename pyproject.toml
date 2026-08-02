@@ -1,7 +1,7 @@
 [project]
 name = "krea_regional_lora"
 description = "Two character LoRAs in one Krea2 / Flux.2-Klein image, each confined to its own region without identity blend. Forward-hook activation injection (fp8-safe), visual region editor, LoRA stacking per zone."
-version = "1.0.0"
+version = "1.2.0"
 license = {file = "LICENSE"}
 dependencies = []
 

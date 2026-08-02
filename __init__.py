@@ -57,7 +57,7 @@ except Exception:
     _WRAPPER_ENUM = "diffusion_model"
 
 WRAPPER_KEY = "regional_character_lora"
-__version__ = "1.0.0"   # keep in sync with pyproject.toml
+__version__ = "1.2.0"   # keep in sync with pyproject.toml
 
 
 # ----------------------------------------------------------------------------
@@ -193,27 +193,6 @@ def _smoothstep_ramp(n, lo, hi):
     return 1.0 - s
 
 
-def _build_masks(split_mode, w, h, feather, blend, bboxes):
-    rows, cols = _build_token_grid(w, h)
-    n = rows * cols
-
-    if split_mode == "horizontal_auto":
-        ramp_rows = _smoothstep_ramp(
-            rows, rows / 2 - feather * rows, rows / 2 + feather * rows)
-        a = ramp_rows.unsqueeze(1).expand(rows, cols).reshape(-1)
-    elif split_mode == "bbox" and bboxes:
-        a = _mask_from_bbox(bboxes, 0, rows, cols, w, h, feather)
-        b = _mask_from_bbox(bboxes, 1, rows, cols, w, h, feather)
-        return _apply_blend(a, b, blend)
-    else:  # vertical_auto (default)
-        ramp_cols = _smoothstep_ramp(
-            cols, cols / 2 - feather * cols, cols / 2 + feather * cols)
-        a = ramp_cols.unsqueeze(0).expand(rows, cols).reshape(-1)
-
-    b = 1.0 - a
-    return _apply_blend(a, b, blend)
-
-
 def _mask_from_bbox(bboxes, idx, rows, cols, w, h, feather):
     n = rows * cols
     if idx >= len(bboxes):
@@ -251,11 +230,27 @@ def _coerce_bbox(box, w, h):
     return x0, y0, x1, y1
 
 
-def _apply_blend(a, b, blend):
-    # blend 0 -> pure regional ; blend 1 -> both at 0.5 everywhere (controlled merge)
-    a = (1.0 - blend) * a + blend * 0.5
-    b = (1.0 - blend) * b + blend * 0.5
-    return a, b
+def _apply_blend(masks, blend):
+    """blend 0 -> pure regional ; blend 1 -> every zone at 1/N everywhere
+    (controlled merge). `masks` is the per-zone list, in zone order."""
+    even = 1.0 / max(1, len(masks))
+    return [(1.0 - blend) * m + blend * even for m in masks]
+
+
+def _complement_the_one_gap(masks, missing):
+    """Convenience shared by every mask source: if exactly ONE zone was left
+    undefined, it gets whatever the other zones don't cover. Two or more gaps is
+    ambiguous, so those zones just get an empty mask (that LoRA stays inert)."""
+    if len(missing) != 1:
+        return
+    i = missing[0]
+    union = None
+    for j, m in enumerate(masks):
+        if j == i:
+            continue
+        union = m if union is None else torch.maximum(union, m)
+    if union is not None:
+        masks[i] = (1.0 - union).clamp(0.0, 1.0)
 
 
 # ----------------------------------------------------------------------------
@@ -273,13 +268,12 @@ def _stack_delta(xf, items):
 
 
 def _make_hook(session, entry):
-    """Forward hook: out += mask_a*delta_a + mask_b*delta_b on the image-token tail.
-    delta_a/delta_b are each the SUM of every LoRA stacked on that side, masked once.
+    """Forward hook: out += sum over zones of mask_z * delta_z on the image-token
+    tail. delta_z is the SUM of every LoRA stacked on that zone, masked once.
     All heavy tensors (LoRA up/down matrices, masks) are pre-moved to device + bf16
     in session._prepare_weights()/_prepare_grid(), so the hook only does matmuls —
     no per-call .to()/cast, and `out` is never up-cast to fp32."""
-    a_list = entry.get("a") or ()
-    b_list = entry.get("b") or ()
+    sides = [(z, items) for z, items in entry.items() if items]
 
     def hook(module, inp, out):
         if not torch.is_tensor(out) or out.dim() < 2:
@@ -290,11 +284,9 @@ def _make_hook(session, entry):
         seq = x.shape[-2]
         xf = x.to(_COMPUTE_DTYPE)
         res = None
-        if a_list:
-            res = session._full_mask("a", seq, out.dim()) * _stack_delta(xf, a_list)
-        if b_list:
-            mb = session._full_mask("b", seq, out.dim()) * _stack_delta(xf, b_list)
-            res = mb if res is None else res + mb
+        for z, items in sides:
+            d = session._full_mask(z, seq, out.dim()) * _stack_delta(xf, items)
+            res = d if res is None else res + d
         if res is None:
             return out
         return out + res.to(out.dtype)
@@ -308,37 +300,34 @@ def _resolve_auto_split(rows, cols):
     return "vertical_auto" if cols > rows else "horizontal_auto"
 
 
-def _masks_from_grid(split_mode, rows, cols, feather, blend):
-    if split_mode == "horizontal_auto":
-        ramp = _smoothstep_ramp(rows, rows / 2 - feather * rows, rows / 2 + feather * rows)
-        a = ramp.unsqueeze(1).expand(rows, cols).reshape(-1)
-    else:  # vertical_auto
-        ramp = _smoothstep_ramp(cols, cols / 2 - feather * cols, cols / 2 + feather * cols)
-        a = ramp.unsqueeze(0).expand(rows, cols).reshape(-1)
-    b = 1.0 - a
-    return _apply_blend(a, b, blend)
+def _masks_from_grid(split_mode, rows, cols, feather, blend, n_zones=2):
+    """Cut the token grid into n_zones equal contiguous slices along one axis:
+    top -> bottom for horizontal_auto, left -> right for vertical_auto, so zone
+    order is reading order (A top/left, then B, then C).
 
+    Each slice is the plateau between its two smoothstep boundaries, so at N=2
+    this is identical to the old ramp/1-ramp pair and the slices sum to 1.0.
+    seam_feather stays in its existing units (a fraction of the whole axis, not
+    of a slice) — so at 3 zones a large feather makes neighbouring seams overlap
+    and the slices sum to slightly under 1.0 near the seams."""
+    axis_n = rows if split_mode == "horizontal_auto" else cols
+    step = axis_n / float(n_zones)
+    # edge[i] = 1.0 left of boundary i, 0.0 right of it. edge[0] is the grid's
+    # left/top wall (nothing before it), edge[n] the far wall (everything).
+    edge = [torch.zeros(axis_n)]
+    for i in range(1, n_zones):
+        edge.append(_smoothstep_ramp(
+            axis_n, i * step - feather * axis_n, i * step + feather * axis_n))
+    edge.append(torch.ones(axis_n))
 
-def _parse_bbox_str(s, w, h):
-    """'x0,y0,x1,y1' -> normalized (0..1) tuple. Accepts normalized or pixel coords
-    (auto-detected: any value >1 => pixels, divided by canvas w/h). None if empty/bad."""
-    if not s or not str(s).strip():
-        return None
-    try:
-        parts = [float(v) for v in str(s).replace(";", ",").split(",") if v.strip() != ""]
-    except Exception:
-        return None
-    if len(parts) < 4:
-        return None
-    x0, y0, x1, y1 = parts[:4]
-    if max(abs(x0), abs(y0), abs(x1), abs(y1)) > 1.0:
-        x0, x1 = x0 / max(1, w), x1 / max(1, w)
-        y0, y1 = y0 / max(1, h), y1 / max(1, h)
-    if x1 < x0:
-        x0, x1 = x1, x0
-    if y1 < y0:
-        y0, y1 = y1, y0
-    return (max(0.0, x0), max(0.0, y0), min(1.0, x1), min(1.0, y1))
+    masks = []
+    for i in range(n_zones):
+        band = (edge[i + 1] - edge[i]).clamp(0.0, 1.0)
+        if split_mode == "horizontal_auto":
+            masks.append(band.unsqueeze(1).expand(rows, cols).reshape(-1))
+        else:
+            masks.append(band.unsqueeze(0).expand(rows, cols).reshape(-1))
+    return _apply_blend(masks, blend)
 
 
 def _rect_token_mask(rows, cols, nx0, ny0, nx1, ny1, feather):
@@ -358,9 +347,11 @@ def _rect_token_mask(rows, cols, nx0, ny0, nx1, ny1, feather):
     return m.clamp(0.0, 1.0)
 
 
-def _masks_from_regions(regions, rows, cols, feather, blend):
-    """Parse the JS editor's regions JSON: [{x,y,w,h,char:'a'|'b'}, ...] in
-    normalized 0-1 coords. Union of each character's rects -> two token masks."""
+def _masks_from_regions(regions, rows, cols, feather, blend, zones=("a", "b")):
+    """Parse the JS editor's regions JSON: [{x,y,w,h,char:'a'|'b'|'c'}, ...] in
+    normalized 0-1 coords. Union of each character's rects -> one token mask per
+    zone. A rect whose char isn't a known zone falls back to the first zone,
+    matching the old 'anything that isn't b is a' behaviour."""
     try:
         items = json.loads(regions) if isinstance(regions, str) else regions
     except Exception:
@@ -368,9 +359,8 @@ def _masks_from_regions(regions, rows, cols, feather, blend):
     if not isinstance(items, list) or not items:
         return None
     n = rows * cols
-    ma = torch.zeros(n)
-    mb = torch.zeros(n)
-    na = nb = 0
+    masks = [torch.zeros(n) for _ in zones]
+    counts = [0] * len(zones)
     for it in items:
         if not isinstance(it, dict):
             continue
@@ -383,18 +373,14 @@ def _masks_from_regions(regions, rows, cols, feather, blend):
         if w <= 0 or h <= 0:
             continue
         ch = str(it.get("char", "a")).lower()
-        m = _rect_token_mask(rows, cols, x, y, x + w, y + h, feather)
-        if ch == "b":
-            mb = torch.maximum(mb, m); nb += 1
-        else:
-            ma = torch.maximum(ma, m); na += 1
-    if na == 0 and nb == 0:
+        i = zones.index(ch) if ch in zones else 0
+        masks[i] = torch.maximum(masks[i], _rect_token_mask(
+            rows, cols, x, y, x + w, y + h, feather))
+        counts[i] += 1
+    if not any(counts):
         return None
-    if na == 0:
-        ma = 1.0 - mb
-    if nb == 0:
-        mb = 1.0 - ma
-    return _apply_blend(ma, mb, blend)
+    _complement_the_one_gap(masks, [i for i, c in enumerate(counts) if c == 0])
+    return _apply_blend(masks, blend)
 
 
 def _flatten_bboxes(bboxes):
@@ -411,37 +397,55 @@ def _flatten_bboxes(bboxes):
     return list(bboxes)
 
 
-def _masks_from_boxlist(boxes, rows, cols, w, h, feather, blend):
-    """box[0] -> A, box[1] -> B (draw order). One box -> B is the complement of A."""
-    ma = _mask_from_bbox(boxes, 0, rows, cols, w, h, feather)
-    mb = _mask_from_bbox(boxes, 1, rows, cols, w, h, feather) if len(boxes) > 1 else (1.0 - ma)
-    return _apply_blend(ma, mb, blend)
+def _masks_from_boxlist(boxes, rows, cols, w, h, feather, blend, n_zones=2):
+    """box[i] -> zone i, in draw order. One box short of the zone count -> the
+    last zone is the complement of the others (2-zone: one box -> B = not-A)."""
+    masks = [_mask_from_bbox(boxes, i, rows, cols, w, h, feather)
+             for i in range(n_zones)]
+    _complement_the_one_gap(masks, list(range(len(boxes), n_zones)))
+    return _apply_blend(masks, blend)
+
+
+def _bake_stacks(stacks):
+    """{zone: [(matrices, strength)]} -> {zone: [{sig: entry_with_baked_scale}]}.
+
+    Called ONCE per node execution and handed to every session, so `model` and
+    `model_b` share the same entry dicts — which means they also share the device
+    tensors `_prepare_weights` hangs off them, and the LoRA weights are moved to
+    VRAM once rather than per model."""
+    return {
+        z: [{sig: {**d, "scale": d["scale"] * strength} for sig, d in mats.items()}
+            for mats, strength in stack]
+        for z, stack in stacks.items()
+    }
 
 
 class _RegionalSession:
     """Holds per-apply config; builds masks at RUNTIME from the real latent grid
     (no reliance on typed canvas dims), then installs/removes hooks each forward.
-    lora_a_stack/lora_b_stack: list of (matrices_dict, strength) per side — one
-    entry per stacked LoRA. A single-LoRA node just passes a 1-item list."""
-    def __init__(self, patcher, lora_a_stack, lora_b_stack,
+    zone_maps: the output of _bake_stacks — {zone: [{sig: entry}, ...]}, one dict
+    per LoRA stacked on that zone. Zone order is the dict's insertion order
+    ('a','b'[,'c']) and defines the geometric slice order. Pass the SAME object to
+    every session that shares one node's settings (model and model_b).
+    mask_ins: {zone: MASK or None} for the painted-mask override sockets."""
+    def __init__(self, patcher, zone_maps,
                  split_mode, seam_feather, blend_override, bboxes,
-                 mask_a_in, mask_b_in, regions_str="", text_strength=1.0):
+                 mask_ins, regions_str="", text_strength=1.0):
         self.patcher = patcher
-        self.lora_a_stack, self.lora_b_stack = lora_a_stack, lora_b_stack
+        self.zone_maps = zone_maps
+        self.zones = tuple(zone_maps)
         self.split_mode = split_mode
         self.seam_feather = seam_feather
         self.blend_override = blend_override
         self.text_strength = text_strength
         self.bboxes = bboxes
-        self.mask_a_in, self.mask_b_in = mask_a_in, mask_b_in
+        self.mask_ins = {z: mask_ins.get(z) for z in self.zones}
         self.regions_str = regions_str
         self.n_img = 0
-        self.mask_a = None
-        self.mask_b = None
+        self.masks = {}
         self._layer_map = None
-        self._weights_prepared = False
-        self._mask_a_d = None
-        self._mask_b_d = None
+        self._weights_prepared = None   # the device the matrices were moved to
+        self._masks_d = {}
         self._last_shape = "unset"
         self._full_mask_cache = {}
 
@@ -449,40 +453,28 @@ class _RegionalSession:
         m = self.patcher.model
         return getattr(m, "diffusion_model", m)
 
-    @staticmethod
-    def _side_maps(stack):
-        """[(matrices_dict, strength), ...] -> [{sig: entry_with_baked_scale}, ...]"""
-        return [
-            {sig: {**d, "scale": d["scale"] * strength} for sig, d in mats.items()}
-            for mats, strength in stack
-        ]
-
     def _build_layer_map(self, dm):
-        amaps = self._side_maps(self.lora_a_stack)
-        bmaps = self._side_maps(self.lora_b_stack)
+        zmaps = self.zone_maps
         layer_map = {}
         matched = 0
         for name, mod in _iter_named_linears(dm):
             sig = _norm(name)
             entry = {}
-            a_entries = [m[sig] for m in amaps if sig in m]
-            b_entries = [m[sig] for m in bmaps if sig in m]
-            if a_entries:
-                entry["a"] = a_entries
-            if b_entries:
-                entry["b"] = b_entries
+            for z in self.zones:
+                hits = [m[sig] for m in zmaps[z] if sig in m]
+                if hits:
+                    entry[z] = hits
             if entry:
                 layer_map[name] = (mod, entry)
                 matched += 1
-        a_targets = sum(len(m) for m in amaps)
-        b_targets = sum(len(m) for m in bmaps)
-        hit = sum(len(e.get("a") or ()) + len(e.get("b") or ())
-                  for _, e in layer_map.values())
-        print(f"[RegionalCharacterLora] matched {matched} layers "
-              f"(A:{len(amaps)} lora(s)/{a_targets} targets, "
-              f"B:{len(bmaps)} lora(s)/{b_targets} targets).")
-        if 0 < hit < a_targets + b_targets:
-            print(f"[RegionalCharacterLora] !! {a_targets + b_targets - hit} LoRA "
+        targets = {z: sum(len(m) for m in zmaps[z]) for z in self.zones}
+        total_targets = sum(targets.values())
+        hit = sum(len(v) for _, e in layer_map.values() for v in e.values())
+        print(f"[RegionalCharacterLora] matched {matched} layers ("
+              + ", ".join(f"{z.upper()}:{len(zmaps[z])} lora(s)/{targets[z]} targets"
+                          for z in self.zones) + ").")
+        if 0 < hit < total_targets:
+            print(f"[RegionalCharacterLora] !! {total_targets - hit} LoRA "
                   f"target(s) matched no model layer - those weights are inert. "
                   f"Run recon_krea2.py to compare key stems.")
         if matched == 0:
@@ -512,53 +504,58 @@ class _RegionalSession:
 
     def _build_masks_now(self, rows, cols):
         feather, blend = self.seam_feather, self.blend_override
+        nz = len(self.zones)
         pw, ph = cols * 16, rows * 16   # pixel reference from the real latent grid
 
         # painted MASK sockets are an always-on advanced override
-        if self.mask_a_in is not None or self.mask_b_in is not None:
-            ma = _mask_to_token_grid(self.mask_a_in, rows, cols) if self.mask_a_in is not None else None
-            mb = _mask_to_token_grid(self.mask_b_in, rows, cols) if self.mask_b_in is not None else None
-            if ma is None:
-                ma = 1.0 - mb
-            if mb is None:
-                mb = 1.0 - ma
-            a, b = _apply_blend(ma, mb, blend)
-            return a, b, "mask-socket"
+        if any(m is not None for m in self.mask_ins.values()):
+            masks = [_mask_to_token_grid(self.mask_ins[z], rows, cols)
+                     if self.mask_ins[z] is not None else torch.zeros(rows * cols)
+                     for z in self.zones]
+            _complement_the_one_gap(
+                masks, [i for i, z in enumerate(self.zones)
+                        if self.mask_ins[z] is None])
+            return _apply_blend(masks, blend), "mask-socket"
 
         mode = self.split_mode
 
         # manual = the on-node visual editor (regions JSON)
         if mode == "manual":
-            res = _masks_from_regions(self.regions_str, rows, cols, feather, blend)
+            res = _masks_from_regions(self.regions_str, rows, cols, feather,
+                                      blend, self.zones)
             if res is not None:
-                a, b = res
-                return a, b, "manual"
+                return res, "manual"
             mode = "auto"   # nothing drawn yet -> sensible fallback
 
         # bbox = KJ/BoundingBox wire (visual editor in KJ's node)
         if mode == "bbox":
             wire = _flatten_bboxes(self.bboxes)
             if wire:
-                a, b = _masks_from_boxlist(wire, rows, cols, pw, ph, feather, blend)
-                return a, b, "bbox-wire(%d)" % len(wire)
+                return (_masks_from_boxlist(wire, rows, cols, pw, ph, feather,
+                                            blend, nz),
+                        "bbox-wire(%d)" % len(wire))
             mode = "auto"   # bbox selected but nothing connected
 
         # geometric auto / vertical / horizontal
         if mode == "auto":
             mode = _resolve_auto_split(rows, cols)
-        a, b = _masks_from_grid(mode, rows, cols, feather, blend)
-        return a, b, mode
+        return _masks_from_grid(mode, rows, cols, feather, blend, nz), mode
 
     def _prepare_weights(self, dev):
         """LoRA up/down matrices only — resolution-independent, so this runs once."""
         cdt = _COMPUTE_DTYPE
         for name, (mod, entry) in self._layer_map.items():
-            for side in ("a", "b"):
-                for d in entry.get(side) or ():
-                    if "down_d" in d:
+            for items in entry.values():
+                for d in items:
+                    # Two sessions (model + model_b) share these dicts, so the
+                    # second one reuses the first's device tensors — VRAM is paid
+                    # once. Keyed on device so a model on a *different* device
+                    # re-moves them instead of silently using the wrong ones.
+                    if d.get("_dev") == dev:
                         continue
                     d["down_d"] = d["down"].to(dev, cdt)
                     d["up_d"] = d["up"].to(dev, cdt) * d["scale"]
+                    d["_dev"] = dev
 
     def _prepare_grid(self, dev, x):
         """Rebuild the token grid + masks from the CURRENT latent. This is cheap
@@ -574,10 +571,9 @@ class _RegionalSession:
         self._dev = dev
         rows, cols, src = self._resolve_grid(x)
         self.n_img = rows * cols
-        a, b, used = self._build_masks_now(rows, cols)
-        self.mask_a, self.mask_b = a, b
-        self._mask_a_d = a.to(dev, cdt)
-        self._mask_b_d = b.to(dev, cdt)
+        masks, used = self._build_masks_now(rows, cols)
+        self.masks = dict(zip(self.zones, masks))
+        self._masks_d = {z: m.to(dev, cdt) for z, m in self.masks.items()}
         self._full_mask_cache = {}
         self._grid_info = (rows, cols, src, used)
         self._last_shape = shape_key
@@ -592,7 +588,7 @@ class _RegionalSession:
         key = (side, seq, ndim)
         fm = self._full_mask_cache.get(key)
         if fm is None:
-            mv = self._mask_a_d if side == "a" else self._mask_b_d
+            mv = self._masks_d[side]
             base = torch.full((seq,), self.text_strength,
                               device=self._dev, dtype=_COMPUTE_DTYPE)
             n_img = self.n_img
@@ -612,9 +608,9 @@ class _RegionalSession:
             self._layer_map = self._build_layer_map(dm)
         x0 = args[0] if args else None
         dev = self._infer_device(dm, args)
-        if not self._weights_prepared:
+        if self._weights_prepared != dev:
             self._prepare_weights(dev)
-            self._weights_prepared = True
+            self._weights_prepared = dev
         if self._prepare_grid(dev, x0):
             rows, cols, src, used = self._grid_info
             shp = tuple(x0.shape) if torch.is_tensor(x0) else None
@@ -650,149 +646,186 @@ def _mask_to_token_grid(mask, rows, cols):
 
 
 # ----------------------------------------------------------------------------
-# the node
+# the nodes
 # ----------------------------------------------------------------------------
+_SPLIT_MODES = ["manual", "auto", "vertical_auto", "horizontal_auto", "bbox"]
+_TEXT_STRENGTH_TIP = (
+    "How strongly each LoRA also transforms the text/conditioning tokens (every "
+    "zone shares them). 1.0 = like a global LoRA load; 0 = image tokens only, "
+    "much weaker identity. MORE ZONES WANT MORE, not less: each seam feathers "
+    "away part of a zone's full-strength area (2 zones keep ~43% of the image at "
+    "full strength each, 3 zones only ~26/18/25%), so each identity leans harder "
+    "on the shared text pathway. Measured: 1.0 is right for 2 zones, ~2.0 for 3. "
+    "Lower it only if characters actually bleed into each other.")
+_SHOW_REF_TIP = (
+    "Draw the last image your graph produced as the backdrop of the region editor, "
+    "so you can drag the boxes onto where the characters actually landed. NOTHING "
+    "NEEDS WIRING - the editor picks up your SaveImage/PreviewImage output after "
+    "the run, in the browser. There is deliberately no image input: that image is "
+    "made downstream of the model this node outputs, so a link back in would be a "
+    "dependency cycle and ComfyUI would reject the graph.")
+_MODEL_B_TIP = (
+    "Optional second model for a two-pass workflow (e.g. Krea2Raw then Turbo). "
+    "It gets the SAME zones, boxes, LoRAs and strengths as the first model - one "
+    "node driving both passes. For different settings per pass, use two nodes.")
+_STACK_SLOTS = 3   # LoRAs per zone on the Stack nodes; unused slots left as "None"
+
+
+def _common_widgets(required):
+    """The config widgets every variant shares, appended after the LoRA slots."""
+    required["split_mode"] = (_SPLIT_MODES,)
+    required["seam_feather"] = ("FLOAT", {"default": 0.08, "min": 0.0, "max": 0.3, "step": 0.01})
+    required["blend_override"] = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05})
+    required["text_strength"] = ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0,
+                                           "step": 0.05, "tooltip": _TEXT_STRENGTH_TIP})
+    required["show_reference"] = ("BOOLEAN", {"default": False, "tooltip": _SHOW_REF_TIP})
+    return required
+
+
+def _optional_widgets(zones):
+    opt = {
+        "model_b": ("MODEL", {"tooltip": _MODEL_B_TIP}),
+        "regions": ("STRING", {"default": "", "tooltip": "managed by the visual editor widget"}),
+        "bboxes": ("BOUNDINGBOX",),
+    }
+    for z in zones:
+        opt[f"mask_{z}"] = ("MASK",)
+    return opt
+
+
+def _install(patched, session, key):
+    def wrapper(executor, *args, **kwargs):
+        return session.run(executor, *args, **kwargs)
+
+    if hasattr(patched, "add_wrapper_with_key"):
+        patched.add_wrapper_with_key(_WRAPPER_ENUM, key, wrapper)
+    elif hasattr(patched, "add_wrapper"):
+        patched.add_wrapper(_WRAPPER_ENUM, wrapper)
+    else:
+        raise RuntimeError(
+            "This ComfyUI build lacks model wrapper support "
+            "(add_wrapper_with_key). Update ComfyUI.")
+    return patched
+
+
 class Krea2RegionalCharacterLoRA:
+    """One LoRA per zone. ZONES is both the widget set (lora_a, lora_b, ...) and
+    the geometric order of the auto-split slices: A is the left/top slice, then B,
+    then C.
+
+    Two MODEL inputs / outputs: wire a second model (e.g. a Turbo pass after a
+    Krea2Raw pass) and it gets the identical zones, boxes, LoRAs and strengths -
+    one node, one set of controls, both passes. Each model gets its own session,
+    because a session holds direct references to one model's nn.Linear modules;
+    the loaded LoRA matrices themselves are shared, so VRAM is paid once."""
+    ZONES = ("a", "b")
+    WRAPPER_SUFFIX = ""
+
     @classmethod
     def INPUT_TYPES(cls):
         loras = _lora_dir_list() or ["<put .safetensors in models/loras>"]
-        return {
-            "required": {
-                "model": ("MODEL",),
-                "lora_a": (loras,),
-                "strength_a": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05}),
-                "lora_b": (loras,),
-                "strength_b": ("FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05}),
-                "split_mode": (["manual", "auto", "vertical_auto", "horizontal_auto", "bbox"],),
-                "seam_feather": ("FLOAT", {"default": 0.08, "min": 0.0, "max": 0.3, "step": 0.01}),
-                "blend_override": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "text_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
-                                            "tooltip": "How strongly each LoRA also transforms the text/"
-                                                       "conditioning tokens (both regions share them). "
-                                                       "1.0 = like a global LoRA load; 0 = old behavior "
-                                                       "(image tokens only - much weaker identity). "
-                                                       "Lower it if the characters bleed into each other."}),
-            },
-            "optional": {
-                "regions": ("STRING", {"default": "", "tooltip": "managed by the visual editor widget"}),
-                "bboxes": ("BOUNDINGBOX",),
-                "mask_a": ("MASK",),
-                "mask_b": ("MASK",),
-            },
-        }
+        required = {"model": ("MODEL",)}
+        for z in cls.ZONES:
+            required[f"lora_{z}"] = (loras,)
+            required[f"strength_{z}"] = (
+                "FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05})
+        return {"required": _common_widgets(required),
+                "optional": _optional_widgets(cls.ZONES)}
 
-    RETURN_TYPES = ("MODEL",)
+    RETURN_TYPES = ("MODEL", "MODEL")
+    RETURN_NAMES = ("model", "model_b")
     FUNCTION = "apply"
     CATEGORY = "conditioning/regional"
 
-    def apply(self, model, lora_a, strength_a, lora_b, strength_b, split_mode,
-              seam_feather, blend_override, text_strength=1.0,
-              regions="", bboxes=None, mask_a=None, mask_b=None):
-        la = _load_lora_matrices(_resolve_lora_path(lora_a))
-        lb = _load_lora_matrices(_resolve_lora_path(lora_b))
+    def _build_stacks(self, kw):
+        """{zone: [(matrices, strength)]} - one LoRA per zone."""
+        return {
+            z: [(_load_lora_matrices(_resolve_lora_path(kw[f"lora_{z}"])),
+                 kw.get(f"strength_{z}", 1.0))]
+            for z in self.ZONES
+        }
 
-        patched = model.clone()
-        session = _RegionalSession(
-            patched, [(la, strength_a)], [(lb, strength_b)],
-            split_mode, seam_feather, blend_override, bboxes,
-            mask_a, mask_b, regions, text_strength)
+    def apply(self, model, split_mode, seam_feather, blend_override,
+              text_strength=1.0, show_reference=False, model_b=None,
+              regions="", bboxes=None, **kw):
+        zone_maps = _bake_stacks(self._build_stacks(kw))   # read + baked once...
+        mask_ins = {z: kw.get(f"mask_{z}") for z in self.ZONES}
 
-        def wrapper(executor, *args, **kwargs):
-            return session.run(executor, *args, **kwargs)
+        out = []
+        for m in (model, model_b):
+            if m is None:
+                out.append(None)
+                continue
+            patched = m.clone()
+            session = _RegionalSession(                    # ...and shared here
+                patched, zone_maps, split_mode, seam_feather, blend_override,
+                bboxes, mask_ins, regions, text_strength)
+            out.append(_install(patched, session, WRAPPER_KEY + self.WRAPPER_SUFFIX))
 
-        if hasattr(patched, "add_wrapper_with_key"):
-            patched.add_wrapper_with_key(_WRAPPER_ENUM, WRAPPER_KEY, wrapper)
-        elif hasattr(patched, "add_wrapper"):
-            patched.add_wrapper(_WRAPPER_ENUM, wrapper)
-        else:
-            raise RuntimeError(
-                "This ComfyUI build lacks model wrapper support "
-                "(add_wrapper_with_key). Update ComfyUI.")
-        return (patched,)
-
-
-_STACK_SLOTS = 3   # LoRAs per zone; unused slots left as "None"
+        # show_reference is read by the editor in the browser; nothing to do here
+        return tuple(out)
 
 
-class Krea2RegionalCharacterLoRAStack:
-    """Same regional injection as Krea2RegionalCharacterLoRA, but each zone (A/B)
-    takes up to _STACK_SLOTS LoRAs instead of exactly one — e.g. a character LoRA
-    + an outfit LoRA in the same region. Leave a slot's lora as "None" to skip it."""
+class Krea2RegionalCharacterLoRA3(Krea2RegionalCharacterLoRA):
+    """Three zones (A/B/C) instead of two - identical in every other respect.
+    auto still uses the same landscape/portrait heuristic as the 2-zone node, so
+    a portrait latent gives top / middle / bottom and a landscape one gives
+    left / middle / right."""
+    ZONES = ("a", "b", "c")
+    WRAPPER_SUFFIX = "_3"
+
+
+class Krea2RegionalCharacterLoRAStack(Krea2RegionalCharacterLoRA):
+    """Same regional injection, but each zone takes up to _STACK_SLOTS LoRAs
+    instead of exactly one - e.g. a character LoRA + an outfit LoRA in the same
+    region. Leave a slot's lora as "None" to skip it."""
+    ZONES = ("a", "b")
+    WRAPPER_SUFFIX = "_stack"
+
     @classmethod
     def INPUT_TYPES(cls):
         loras = ["None"] + (_lora_dir_list() or [])
         required = {"model": ("MODEL",)}
-        for side in ("a", "b"):
+        for z in cls.ZONES:
             for i in range(1, _STACK_SLOTS + 1):
-                required[f"lora_{side}{i}"] = (loras,)
-                required[f"strength_{side}{i}"] = (
+                required[f"lora_{z}{i}"] = (loras,)
+                required[f"strength_{z}{i}"] = (
                     "FLOAT", {"default": 1.0, "min": -4.0, "max": 4.0, "step": 0.05})
-        required["split_mode"] = (["manual", "auto", "vertical_auto", "horizontal_auto", "bbox"],)
-        required["seam_feather"] = ("FLOAT", {"default": 0.08, "min": 0.0, "max": 0.3, "step": 0.01})
-        required["blend_override"] = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05})
-        required["text_strength"] = ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
-                                               "tooltip": "How strongly each LoRA also transforms the text/"
-                                                          "conditioning tokens (both regions share them). "
-                                                          "1.0 = like a global LoRA load; 0 = old behavior "
-                                                          "(image tokens only - much weaker identity). "
-                                                          "Lower it if the characters bleed into each other."})
-        return {
-            "required": required,
-            "optional": {
-                "regions": ("STRING", {"default": "", "tooltip": "managed by the visual editor widget"}),
-                "bboxes": ("BOUNDINGBOX",),
-                "mask_a": ("MASK",),
-                "mask_b": ("MASK",),
-            },
-        }
+        return {"required": _common_widgets(required),
+                "optional": _optional_widgets(cls.ZONES)}
 
-    RETURN_TYPES = ("MODEL",)
-    FUNCTION = "apply"
-    CATEGORY = "conditioning/regional"
-
-    def apply(self, model, split_mode, seam_feather, blend_override, text_strength=1.0,
-              regions="", bboxes=None, mask_a=None, mask_b=None, **kwargs):
-        def build_stack(side):
+    def _build_stacks(self, kw):
+        stacks = {}
+        for z in self.ZONES:
             stack = []
             for i in range(1, _STACK_SLOTS + 1):
-                mats = _load_optional_lora(kwargs.get(f"lora_{side}{i}"))
+                mats = _load_optional_lora(kw.get(f"lora_{z}{i}"))
                 if mats is not None:
-                    stack.append((mats, kwargs.get(f"strength_{side}{i}", 1.0)))
-            return stack
-
-        a_stack, b_stack = build_stack("a"), build_stack("b")
-        if not a_stack and not b_stack:
-            print("[RegionalCharacterLoraStack] !! no LoRAs selected in either "
+                    stack.append((mats, kw.get(f"strength_{z}{i}", 1.0)))
+            stacks[z] = stack   # an empty zone keeps its slot, so the other
+                                # zones' slices don't shift
+        if not any(stacks.values()):
+            print("[RegionalCharacterLoraStack] !! no LoRAs selected in any "
                   "zone - model passed through unchanged.")
+        return stacks
 
-        patched = model.clone()
-        session = _RegionalSession(
-            patched, a_stack, b_stack,
-            split_mode, seam_feather, blend_override, bboxes,
-            mask_a, mask_b, regions, text_strength)
 
-        def wrapper(executor, *args, **wkwargs):
-            return session.run(executor, *args, **wkwargs)
-
-        if hasattr(patched, "add_wrapper_with_key"):
-            patched.add_wrapper_with_key(_WRAPPER_ENUM, WRAPPER_KEY + "_stack", wrapper)
-        elif hasattr(patched, "add_wrapper"):
-            patched.add_wrapper(_WRAPPER_ENUM, wrapper)
-        else:
-            raise RuntimeError(
-                "This ComfyUI build lacks model wrapper support "
-                "(add_wrapper_with_key). Update ComfyUI.")
-        return (patched,)
+class Krea2RegionalCharacterLoRAStack3(Krea2RegionalCharacterLoRAStack):
+    """Three zones, up to _STACK_SLOTS LoRAs each: a1/a2/a3, b1/b2/b3, c1/c2/c3."""
+    ZONES = ("a", "b", "c")
+    WRAPPER_SUFFIX = "_stack3"
 
 
 WEB_DIRECTORY = "./web"
 NODE_CLASS_MAPPINGS = {
     "Krea2RegionalCharacterLoRA": Krea2RegionalCharacterLoRA,
-    "RegionalCharacterLora": Krea2RegionalCharacterLoRA,   # legacy id, keeps old graphs loading
+    "Krea2RegionalCharacterLoRA3": Krea2RegionalCharacterLoRA3,
     "Krea2RegionalCharacterLoRAStack": Krea2RegionalCharacterLoRAStack,
+    "Krea2RegionalCharacterLoRAStack3": Krea2RegionalCharacterLoRAStack3,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Krea2RegionalCharacterLoRA": "Krea2 Regional Character LoRA",
-    "RegionalCharacterLora": "Krea2 Regional Character LoRA (legacy id)",
+    "Krea2RegionalCharacterLoRA3": "Krea2 Regional Character LoRA (3 zones)",
     "Krea2RegionalCharacterLoRAStack": "Krea2 Regional Character LoRA (Stack)",
+    "Krea2RegionalCharacterLoRAStack3": "Krea2 Regional Character LoRA (3 zones, Stack)",
 }
