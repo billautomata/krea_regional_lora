@@ -723,7 +723,7 @@ class Krea2RegionalCharacterLoRA:
 
     @classmethod
     def INPUT_TYPES(cls):
-        loras = _lora_dir_list() or ["<put .safetensors in models/loras>"]
+        loras = ["None"] + (_lora_dir_list() or [])
         required = {"model": ("MODEL",)}
         for z in cls.ZONES:
             required[f"lora_{z}"] = (loras,)
@@ -738,12 +738,13 @@ class Krea2RegionalCharacterLoRA:
     CATEGORY = "conditioning/regional"
 
     def _build_stacks(self, kw):
-        """{zone: [(matrices, strength)]} - one LoRA per zone."""
-        return {
-            z: [(_load_lora_matrices(_resolve_lora_path(kw[f"lora_{z}"])),
-                 kw.get(f"strength_{z}", 1.0))]
-            for z in self.ZONES
-        }
+        """{zone: [(matrices, strength)]} - one LoRA per zone, "None" = empty
+        zone (keeps its geometric slot)."""
+        stacks = {}
+        for z in self.ZONES:
+            mats = _load_optional_lora(kw.get(f"lora_{z}"))
+            stacks[z] = [] if mats is None else [(mats, kw.get(f"strength_{z}", 1.0))]
+        return stacks
 
     def apply(self, model, split_mode, seam_feather, blend_override,
               text_strength=1.0, show_reference=False, model_b=None,
