@@ -211,6 +211,61 @@ def test_two_models_hook_their_own_layers():
     assert da["down_d"].device == torch.device("cpu")
 
 
+def test_isolation_contains_the_text_pathway():
+    """isolate=True: B's LoRA runs GLOBALLY inside its own pass (text tokens
+    included — the exact pathway that leaks everywhere in single-pass mode), yet
+    the composite keeps the effect strictly inside B's latent slice. Zone A is
+    empty, so coverage has a gap and a clean baseline pass must run."""
+    tiny, mats = _tiny_lora()
+
+    class P:
+        model = tiny
+
+    sess = _RegionalSession(P(), _bake_stacks({"a": [], "b": [(mats, 1.0)]}),
+                            "horizontal_auto", 0.0, 0.0, None, {}, "", 1.0,
+                            isolate=True)
+    latent = torch.zeros(1, 4, 24, 24)
+    tokens = torch.ones(1, 2 + 144, 4)
+    text_deltas = []
+
+    def executor(lat, seq):
+        o = tiny.attn_wq(seq)
+        text_deltas.append(float(o[0, 0, 0]))            # delta on a TEXT token
+        return torch.full_like(lat, float(o[0, -1, 0]))  # uniform image effect
+
+    out = sess.run(executor, latent, tokens)
+    assert len(text_deltas) == 2, "expected B's pass + one clean baseline pass"
+    assert max(text_deltas) > 0.99, "B's pass didn't apply its LoRA to the text tokens"
+    assert out[0, 0, 23].min() > 0.99, "B's zone (bottom) lost its LoRA effect"
+    assert out[0, 0, 0].max() < 0.01, "B leaked outside its zone despite isolation"
+
+
+def test_isolation_full_coverage_skips_clean_pass():
+    """Both zones filled -> the grid masks sum to 1, so exactly one pass per zone
+    (no clean baseline) and each half shows only its own zone's effect."""
+    tiny, mats = _tiny_lora()
+
+    class P:
+        model = tiny
+
+    sess = _RegionalSession(P(),
+                            _bake_stacks({"a": [(mats, 1.0)], "b": [(mats, 2.0)]}),
+                            "horizontal_auto", 0.0, 0.0, None, {}, "", 1.0,
+                            isolate=True)
+    latent = torch.zeros(1, 4, 24, 24)
+    tokens = torch.ones(1, 2 + 144, 4)
+    calls = []
+
+    def executor(lat, seq):
+        calls.append(1)
+        return torch.full_like(lat, float(tiny.attn_wq(seq)[0, -1, 0]))
+
+    out = sess.run(executor, latent, tokens)
+    assert len(calls) == 2, "full coverage should not need a clean pass"
+    assert abs(float(out[0, 0, 0, 0]) - 1.0) < 0.01, "A's half isn't A's output"
+    assert abs(float(out[0, 0, 23, 0]) - 2.0) < 0.01, "B's half isn't B's output"
+
+
 class _FakePatcher:
     """Stands in for a ComfyUI ModelPatcher: clone + wrapper registration only."""
     def __init__(self, tag):

@@ -267,12 +267,14 @@ def _stack_delta(xf, items):
     return total
 
 
-def _make_hook(session, entry):
+def _make_hook(session, entry, uniform=False):
     """Forward hook: out += sum over zones of mask_z * delta_z on the image-token
     tail. delta_z is the SUM of every LoRA stacked on that zone, masked once.
     All heavy tensors (LoRA up/down matrices, masks) are pre-moved to device + bf16
     in session._prepare_weights()/_prepare_grid(), so the hook only does matmuls —
-    no per-call .to()/cast, and `out` is never up-cast to fp32."""
+    no per-call .to()/cast, and `out` is never up-cast to fp32.
+    uniform=True is the isolation path: the zone's LoRA runs globally (like a
+    plain LoRA load) because containment happens later, in latent space."""
     sides = [(z, items) for z, items in entry.items() if items]
 
     def hook(module, inp, out):
@@ -285,13 +287,41 @@ def _make_hook(session, entry):
         xf = x.to(_COMPUTE_DTYPE)
         res = None
         for z, items in sides:
-            d = session._full_mask(z, seq, out.dim()) * _stack_delta(xf, items)
+            m = (session._uniform_mask(seq, out.dim()) if uniform
+                 else session._full_mask(z, seq, out.dim()))
+            d = m * _stack_delta(xf, items)
             res = d if res is None else res + d
         if res is None:
             return out
         return out + res.to(out.dtype)
 
     return hook
+
+
+def _upsample_weight(mask_flat, rows, cols, spatial):
+    """Token-grid mask -> latent-resolution weight [1,1,H,W]; broadcasts over
+    [B,C,H,W] and [B,C,T,H,W] model outputs."""
+    import torch.nn.functional as F
+    m = mask_flat.view(1, 1, rows, cols).float()
+    return F.interpolate(m, size=spatial, mode="bilinear", align_corners=False)
+
+
+def _blend_isolated(zone_outs, weights, clean):
+    """Composite per-zone full-strength model outputs in latent space. With full
+    coverage (weights sum to ~1 everywhere) it's a normalized weighted sum; with
+    gaps or overlaps `clean` (a no-LoRA pass) is the baseline and each zone
+    contributes weight * (its output - clean)."""
+    if clean is not None:
+        res = clean
+        for z, o in zone_outs.items():
+            res = res + weights[z].to(o.dtype) * (o - clean)
+        return res
+    res, total = None, None
+    for z, o in zone_outs.items():
+        w = weights[z].to(o.dtype)
+        res = w * o if res is None else res + w * o
+        total = w if total is None else total + w
+    return res / total.clamp(min=1e-3)
 
 
 def _resolve_auto_split(rows, cols):
@@ -430,7 +460,8 @@ class _RegionalSession:
     mask_ins: {zone: MASK or None} for the painted-mask override sockets."""
     def __init__(self, patcher, zone_maps,
                  split_mode, seam_feather, blend_override, bboxes,
-                 mask_ins, regions_str="", text_strength=1.0):
+                 mask_ins, regions_str="", text_strength=1.0, isolate=False):
+        self.isolate = isolate
         self.patcher = patcher
         self.zone_maps = zone_maps
         self.zones = tuple(zone_maps)
@@ -602,6 +633,62 @@ class _RegionalSession:
             self._full_mask_cache[key] = fm
         return fm
 
+    def _uniform_mask(self, seq, ndim):
+        """Isolation-pass mask: image tail at 1.0 everywhere, text prefix at
+        text_strength (1.0 = exactly a global LoRA load). Spatial containment
+        happens after the pass, in latent space, not here."""
+        key = ("*", seq, ndim)
+        fm = self._full_mask_cache.get(key)
+        if fm is None:
+            base = torch.full((seq,), self.text_strength,
+                              device=self._dev, dtype=_COMPUTE_DTYPE)
+            n_img = self.n_img
+            if 0 < n_img <= seq:
+                base[seq - n_img:] = 1.0
+            fm = base.view(*([1] * (ndim - 2)), seq, 1)
+            self._full_mask_cache[key] = fm
+        return fm
+
+    def _run_isolated(self, executor, args, kwargs):
+        """Two-memory-slots mode: one full forward per zone with only that zone's
+        LoRAs hooked, applied GLOBALLY (its own private text tokens included),
+        then the outputs are composited with the zone masks in latent space —
+        where every value has coordinates, so nothing can leak through the shared
+        prompt. Costs one extra model pass per active zone (+1 clean pass when
+        the masks don't cover the canvas).
+        # ponytail: zones run sequentially; batch them into one call if step time matters
+        """
+        x0 = args[0] if args else None
+        rows, cols = self._grid_info[0], self._grid_info[1]
+        spatial = tuple(x0.shape[-2:])
+        active, weights = [], {}
+        for z in self.zones:
+            if float(self.masks[z].max()) <= 0:
+                continue
+            layers = [(mod, {z: entry[z]})
+                      for mod, entry in self._layer_map.values() if z in entry]
+            if not layers:
+                continue
+            active.append((z, layers))
+            weights[z] = _upsample_weight(self.masks[z], rows, cols,
+                                          spatial).to(x0.device)
+        if not active:
+            return executor(*args, **kwargs)
+        outs = {}
+        for z, layers in active:
+            handles = [mod.register_forward_hook(_make_hook(self, e, uniform=True))
+                       for mod, e in layers]
+            try:
+                outs[z] = executor(*args, **kwargs)
+            finally:
+                for h in handles:
+                    h.remove()
+        total = weights[active[0][0]]
+        for z, _ in active[1:]:
+            total = total + weights[z]
+        clean = executor(*args, **kwargs) if (total - 1.0).abs().max() > 1e-3 else None
+        return _blend_isolated(outs, weights, clean)
+
     def run(self, executor, *args, **kwargs):
         dm = self._diffusion_model()
         if self._layer_map is None:
@@ -615,12 +702,15 @@ class _RegionalSession:
             rows, cols, src, used = self._grid_info
             shp = tuple(x0.shape) if torch.is_tensor(x0) else None
             print(f"[RegionalCharacterLora] grid ready on {dev} | latent={shp} "
-                  f"grid={rows}x{cols} ({src}) n_img={self.n_img} split={used}")
+                  f"grid={rows}x{cols} ({src}) n_img={self.n_img} split={used} "
+                  f"isolate={self.isolate}")
             if src == "canvas-fallback":
                 print("[RegionalCharacterLora] !! WARNING: latent shape was unreadable, "
                       "fell back to a hardcoded 1024x1536 grid. Masks do NOT match your "
                       "actual resolution — this should not happen in normal use; "
                       "check what's calling the model wrapper.")
+        if self.isolate:
+            return self._run_isolated(executor, args, kwargs)
         handles = []
         try:
             for name, (mod, entry) in self._layer_map.items():
@@ -657,6 +747,15 @@ _TEXT_STRENGTH_TIP = (
     "full strength each, 3 zones only ~26/18/25%), so each identity leans harder "
     "on the shared text pathway. Measured: 1.0 is right for 2 zones, ~2.0 for 3. "
     "Lower it only if characters actually bleed into each other.")
+_ISOLATE_TIP = (
+    "Hard containment. ON: the model runs once per zone with that zone's LoRA "
+    "applied globally (its own private copy of the text tokens included), and the "
+    "outputs are composited with the zone masks in latent space — nothing can "
+    "leak through the shared prompt, even for LoRAs that live entirely in the "
+    "text-conditioning layers. Costs one extra full model pass per zone (2 zones "
+    "~2x step time; +1 clean pass if your boxes don't cover the canvas). "
+    "OFF: the old single-pass activation blend, where text_strength is the "
+    "leak-vs-likeness tradeoff.")
 _SHOW_REF_TIP = (
     "Draw the last image your graph produced as the backdrop of the region editor, "
     "so you can drag the boxes onto where the characters actually landed. NOTHING "
@@ -678,6 +777,7 @@ def _common_widgets(required):
     required["blend_override"] = ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05})
     required["text_strength"] = ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0,
                                            "step": 0.05, "tooltip": _TEXT_STRENGTH_TIP})
+    required["isolate_zones"] = ("BOOLEAN", {"default": True, "tooltip": _ISOLATE_TIP})
     required["show_reference"] = ("BOOLEAN", {"default": False, "tooltip": _SHOW_REF_TIP})
     return required
 
@@ -747,8 +847,8 @@ class Krea2RegionalCharacterLoRA:
         return stacks
 
     def apply(self, model, split_mode, seam_feather, blend_override,
-              text_strength=1.0, show_reference=False, model_b=None,
-              regions="", bboxes=None, **kw):
+              text_strength=1.0, isolate_zones=True, show_reference=False,
+              model_b=None, regions="", bboxes=None, **kw):
         zone_maps = _bake_stacks(self._build_stacks(kw))   # read + baked once...
         mask_ins = {z: kw.get(f"mask_{z}") for z in self.ZONES}
 
@@ -760,7 +860,7 @@ class Krea2RegionalCharacterLoRA:
             patched = m.clone()
             session = _RegionalSession(                    # ...and shared here
                 patched, zone_maps, split_mode, seam_feather, blend_override,
-                bboxes, mask_ins, regions, text_strength)
+                bboxes, mask_ins, regions, text_strength, isolate_zones)
             out.append(_install(patched, session, WRAPPER_KEY + self.WRAPPER_SUFFIX))
 
         # show_reference is read by the editor in the browser; nothing to do here

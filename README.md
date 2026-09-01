@@ -126,6 +126,14 @@ to not having the feature.
   **1.0 for 2 zones, ~2.0 for 3**. Lower it only if characters actually bleed. (Unrelated to the `clip`
   strength on stock loaders — that patches the separate text encoder; this stays in the
   model-only path.)
+- **isolate_zones** *(default ON)* — hard containment. The model runs once per zone
+  with that zone's LoRA applied globally (its own private copy of the text tokens
+  included), and the outputs are composited with the zone masks in latent space, where
+  every value has coordinates. Nothing can leak through the shared prompt — even LoRAs
+  that live entirely in Krea2's text-conditioning layers stay in their box. Costs one
+  extra full model pass per zone (2 zones ≈ 2× step time, plus one clean baseline pass
+  when the boxes don't cover the whole canvas). Turn it OFF for the old single-pass
+  activation blend, where `text_strength` is the leak-vs-likeness tradeoff.
 - **mask_a / mask_b** *(experimental)* — feed hand-painted MASK tensors to override.
 
 ## The one rule that matters: place the box where the LoRA's features live
